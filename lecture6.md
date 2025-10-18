@@ -1,242 +1,135 @@
-# Lecture 6 – Logical Clocks and Ordering in Distributed Systems
+# EECS 491 — Lecture 06: Logical Clocks
 
-## 1. Recap: MapReduce and Stateless Computation
-
-- **MapReduce** is a simple but powerful model that splits computation into:
-  - **Map:** Convert inputs into intermediate key–value pairs.
-  - **Reduce:** Combine values with the same key into a single output.
-- Many large-scale problems fit this framework because:
-  - The system provides **scalability** and **fault tolerance** automatically.
-  - Workers are **stateless**: each job’s output depends *only* on its input.
-- **Constraint:** All `map` tasks must finish before any `reduce` starts.
-
-**Key properties of MapReduce:**
-- Stateless workers.
-- No concurrent interdependencies.
-- Built-in load balancing and failure recovery.
+> A little “not knowing” makes some things easier — we only need to preserve orders that **matter** (causal), and we can choose convenient orders for events that **don’t**.
 
 ---
 
-## 2. Stateful Computations and Finite State Machines (FSMs)
-
-- Some computations depend on **past inputs** — these are **stateful**.
-- Such systems can be modeled as **deterministic finite state machines (FSMs)**:
-  - Computation = states + transitions.
-  - Each transition is deterministic (same next state for same input/state).
-
-### Replication for Fault Tolerance
-- To tolerate failures, we replicate the FSM across nodes.
-- Replicas must communicate and stay **consistent**, but:
-  - Communication is **delayed** and **asynchronous**.
-  - Hence, replicas are **temporally separated**.
-
-### Goal
-Ensure all replicas **eventually agree** on the same sequence of updates.
+## Learning objectives
+- Understand **happens-before** (→) and **concurrency** (∥) in distributed systems.  
+- Construct and reason about **Lamport (logical) clocks** that preserve causality.  
+- Extend logical time to a **total order** usable by replicas.  
+- See how logical clocks support **replicated state machines (RSMs)** and user-facing consistency.
 
 ---
 
-## 3. The Need for Ordering
-
-To maintain consistency, replicas must:
-- See **the same updates in the same order**.
-- Use a consistent ordering mechanism independent of real clocks.
-
-### Why Not Use Wall-Clock Time?
-- **Clock drift** violates monotonicity (time should always move forward).
-- Synchronizing clocks is approximate — not guaranteed.
-- Real-time ordering can be ambiguous due to network delay.
+## Last time (recap)
+- **MapReduce**: stateless workers; same input ⇒ same output; all `map()` must finish before any `reduce()` start.  
+- **Replicated state**: stateful computations depend on message **plus** (some set of) past messages; replicas must eventually agree ⇒ need a **single order** of updates.  
+- **Wall-clock is unreliable** for ordering: drift, non-monotonicity, and message delays.
 
 ---
 
-## 4. Causality and Observability
-
-- **Causality:** Event A *causes* event B if A could influence B’s input.
-  - Example: “Deposit $100” must occur before “Check balance.”
-- **Concurrency:** If A cannot influence B and vice versa, they are concurrent.
-
-**We only care about the order that an *observer* can detect.**
-
-### Example
-- You deposit money → system confirms.
-- Any later query to *any replica* must reflect that deposit.
-- If it doesn’t, time appears to “go backward.”
+## What is a distributed system?
+A collection of distinct processes that: (1) are spatially separated, (2) communicate by **messages**, (3) have non-negligible, variable **delays**, and (4) **do not share fate**.
 
 ---
 
-## 5. Logical Clocks (Lamport Clocks)
-
-We track event order using **logical clocks**, not real time.
-
-### Properties
-- Preserve **causality**: if A → B, then `T(A) < T(B)`.
-- May over-order events (that’s fine — it doesn’t affect correctness).
-
-### Definition
-For events A, B:
-- If A happened before B (A → B), then `T(A) < T(B)`.
-- If `T(A) < T(B)`, it doesn’t necessarily mean A → B.
+## Motivating example (project partners)
+- Me: “I’ll fix `foo()` if you fix `bar()`.” You: “OK.”  
+- You later: “I fixed `bar()`.”  
+- Me: “Great, I fixed `foo()`.”  
+Key point: You **can’t tell** whether I fixed `foo()` *before* or *after* your “I fixed bar” message—only that when I *say* it’s fixed, you may **rely** on it thereafter.
 
 ---
 
-## 6. Formal “Happens-Before” Relation
+## Happens-before and concurrency
+- **Happens-before (A → B)**: It was **possible** for A’s effects to influence B (directly or transitively).  
+- **Concurrent (C ∥ D)**: Neither C → D nor D → C; their relative order **doesn’t affect** externally observable correctness.
+- We want timestamps **T(e)** such that: if **A → B**, then **T(A) < T(B)**. (The **converse need not hold**.)
 
-A “happens-before” relation (→) is defined by:
+### Three event types
+1. Internal event (within a process).
+2. **Send** of a message.
+3. **Receive** of a message (paired with exactly one send, assuming reliable delivery here).
 
-1. **Process order:**  
-   Within the same process, if A occurs before B, then A → B.
-
-2. **Message order:**  
-   If event A is the **send** of a message and B is the **receive**, then A → B.
-
-3. **Transitivity:**  
-   If A → B and B → C, then A → C.
-
-This ensures a **partial order** over all events.
-
----
-
-## 7. Assigning Logical Clock Values
-
-Each process maintains its own **clock `C_i`**.
-
-Rules:
-1. **Initialization:** `C_i = 0` at process start.
-2. **Internal events:**  
-   For each event, increment the local clock:  
-   `C_i := C_i + 1`
-3. **Send event:**  
-   When sending a message, attach current `C_i` to it.
-4. **Receive event:**  
-   On receiving a message with timestamp `t_m`:  
-   `C_i := max(C_i, t_m) + 1`
-
-Result: For any A → B, `C(A) < C(B)`.
+### Formal rules of →
+1. **Process order**: within one process, earlier event a precedes later event b ⇒ **a → b**.  
+2. **Message order**: send b precedes its receive c ⇒ **b → c**.  
+3. **Transitivity**: if **a → b** and **b → c**, then **a → c**.
 
 ---
 
-## 8. Example Walkthrough
+## Lamport (logical) clocks
+Each process **i** keeps an integer clock **Cᵢ**.
 
-Process 1 and Process 2:
-- `A (1)` → internal → `B (2)` → send → `C`
-- Message from B to C carries timestamp 2.
-- Receiver sets `C := max(local, received) + 1`.
+**Algorithm (per event e at process i):**
+1. **Before** executing any event at i: `Cᵢ ← Cᵢ + 1`  
+2. **When sending** message m: include timestamp `ts = Cᵢ(m_send)`.  
+3. **When receiving** message m with timestamp `ts`:  
+   `Cᵢ ← max(Cᵢ, ts) + 1`  
+   (Then timestamp the receive event with this new `Cᵢ`.)
 
-Thus, timestamps progress causally across processes.
-
-These timestamps are **Lamport (logical) clocks**.
-
----
-
-## 9. Interpreting Concurrent Events
-
-Two events can be **concurrent** if:
-- Neither can causally affect the other.
-- Order doesn’t matter — observers can’t tell the difference.
-
-Example:
-- Event F (timestamp 3) occurs before B (timestamp 2) in wall-clock time.  
-  Still fine if F and B are independent — **no causal violation**.
+**Clock condition:** If **a → b**, then **C(a) < C(b)** (by construction).  
+**Not conversely:** `C(x) < C(y)` **does not imply** `x → y` (x and y may be concurrent).
 
 ---
 
-## 10. Key Takeaways on Observability
+## From partial to total order
+Logical clocks give a **partial order** (respecting causality). For RSMs, we often need a **total order**:
+- Tie-break equal logical times by **node ID**.  
+- Stamp each event e at process i as a pair `(C(e), i)` and order lexicographically:
+  - `(t₁, i) < (t₂, j)` if `t₁ < t₂`, or (`t₁ == t₂` **and** `i < j`).  
+- Note: Two events **within one process** can’t share the same `C(e)`, so ties only arise **across** processes.
 
-- Distributed systems only need to satisfy **observable correctness**.
-- It doesn’t matter what “really happened,” only what observers can tell.
-
-> **Rule:** If no external observer can tell the difference, both orders are valid.
-
----
-
-## 11. Replicated State Machines (RSMs)
-
-- Each replica runs the same deterministic state machine.
-- To ensure consistency:
-  - Apply **the same ordered sequence of events** at every replica.
-- If events A and B are concurrent:
-  - Either order is valid, but **all replicas must choose the same one**.
+This yields a **global total order** that (a) **respects causality** and (b) **decides** an order for concurrent events deterministically.
 
 ---
 
-## 12. Generating a Total Order
+## Applying to Replicated State Machines (RSMs)
+- Deterministic FSM: state + input ⇒ next state. Replicas must apply **the same transitions in the same order**.  
+- With logical clocks:
+  - Assign each operation **O** a time **T(O)**.  
+  - A replica can safely apply O once it knows **all operations U with U → O** have been (or will be) placed **before** O: i.e., it has seen messages confirming peers’ clocks ≥ **T(O)**.  
+  - **Heartbeats** (or any message) help disseminate clock advancement, even when no user ops are in flight.
 
-To get a **total order** from Lamport clocks:
-
-1. No two events in the same process can share a timestamp.
-2. For events in different processes with equal timestamps:
-   - Break ties using a unique **process ID**.
-
-### Combined Timestamp
-`T = (C_i, ID_i)`  
-Order lexicographically:
-- Compare `C_i` first.
-- If equal, compare `ID_i`.
-
-This ensures a **global, deterministic ordering** across replicas.
+**Why this matters (user example):**  
+A: “Block manager.” B: “Done.” C: “Post: I hated my internship.”  
+Respecting logical time ensures **A → B → C**, so the post won’t be visible to the manager if A preceded C.
 
 ---
 
-## 13. Unique Identifiers (Process IDs)
-
-- Each process gets a unique ID (e.g., via hardware **MAC address**).
-- This guarantees tie-breaking consistency.
-- Every event can be represented as `(timestamp, process_id)`.
-
----
-
-## 14. Applying Global Order
-
-- Each operation is tagged with its **Lamport timestamp**.
-- Replicas apply operations in order of these timestamps.
-- Ensures all replicas see updates in the same sequence.
+## Subtleties & caveats
+- Logical clocks **preserve causality** but may still impose an arbitrary order on **concurrent** events—acceptable because observers **cannot detect** a difference.  
+- They do **not** measure real time; they measure **event precedence**.  
+- To model failures, partitions, and losses, we’ll build on this foundation (e.g., vector clocks, consensus).
 
 ---
 
-## 15. Why Logical Time Matters
-
-Logical clocks guarantee:
-- All **causally related** events are ordered correctly.
-- All **replicas** maintain the same causal history.
-- No observer sees “time reversal” or inconsistent updates.
-
----
-
-## 16. Real-World Example: Social Media Scenario
-
-- User posts “Block manager” → later posts “I hated my internship.”
-- If server processes the second event before the first, results differ.
-- Respecting Lamport clocks ensures causal order is preserved:
-  - Block action (`A`) happens before post (`C`).
+## Worked mini-example (message receive)
+Suppose process P₁ sends to P₂ while both start at 0:  
+- P₁: internal event → `C₁=1`; send m → `C₁=2` (message carries `ts=2`)  
+- P₂: receives m with `ts=2` while `C₂=0` ⇒ `C₂ ← max(0,2)+1 = 3` (receive event time 3)  
+Thus **send(2) → recv(3)**, satisfying the clock condition.
 
 ---
 
-## 17. Reflection: What Makes Distributed Systems Hard
+## Pseudocode (per process i)
+```text
+C_i := 0
 
-- The challenge is not knowing the *real order*, but enforcing a *consistent one*.
-- **Key insight:** “If no one can observe a difference, it’s not wrong.”
+on_internal_event():
+  C_i := C_i + 1
+  timestamp(event) := C_i
 
-> “The way to solve problems in distributed systems is to decide what you don’t need to know.”
+on_send(msg):
+  C_i := C_i + 1
+  msg.ts := C_i
+  send(msg)
+
+on_receive(msg):
+  C_i := max(C_i, msg.ts) + 1
+  timestamp(receive_event) := C_i
+```
 
 ---
 
-## 18. Philosophical Takeaway
-
-> “In times of great change, learners inherit the earth, while the learned find themselves beautifully equipped for a world that no longer exists.”
-
-Distributed systems challenge our intuition:
-- Events don’t have one universal order.
-- “Correctness” is about *observable causality*, not *absolute time*.
+## Key takeaways
+- **Causality first**: Only preserve orders that external observers could detect.  
+- **Lamport clocks**: Simple, local, and guarantee `a → b ⇒ C(a) < C(b)`.  
+- **Total order**: Break ties with node IDs to drive identical ordering at all replicas.  
+- This is the backbone for **ordering** in fault-tolerant, replicated systems.
 
 ---
 
-# Summary Table
-
-| Concept | Definition / Rule | Example |
-|----------|------------------|----------|
-| Stateless Worker | Output depends only on input | MapReduce mapper |
-| Stateful System | Depends on past messages | Key-value store |
-| Happens-Before (→) | A influences B | Message send → receive |
-| Concurrency | A ↮ B, neither influences other | Two independent tasks |
-| Logical Clock Rule | Increment, send, receive rules | `C_i := max(C_i, recv)+1` |
-| Lamport Clock | Logical time preserving causality | Used in RSM ordering |
-| Total Order | `(timestamp, process_id)` | Break ties deterministically |
+### References
+- EECS 491, Lecture 06 slides and in-class transcript.
